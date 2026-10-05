@@ -1,1 +1,1 @@
-# Mimic-Logic-
+# MimicLogic
