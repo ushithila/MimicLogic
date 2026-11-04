@@ -2,3 +2,5 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+room_bank_*.json
+game_log.jsonl

@@ -23,8 +23,9 @@ import json
 import random
 from dataclasses import dataclass, field
 
-from puzzle import (ARITY, DIRECTIONS, INSTRUCTIONS, PATTERNS, RULES, STATEMENT_TYPES,
-                    render, solve_all, solve_with_trace, statement_truth)
+from puzzle import (ARITY, DIRECTIONS, INSTRUCTIONS, PATTERNS, RULES, RULES_VERSION,
+                    STATEMENT_TYPES, is_giveaway, make_room_id, render, solve_all,
+                    solve_with_trace, statement_key, statement_truth)
 
 
 @dataclass
@@ -47,7 +48,8 @@ class Settings:
 class GeneratorAgent:
     def __init__(self, seed: int | None = None):
         self.rng = random.Random(seed)
-        self.counter = 0
+        self.level = None
+        self._giveaway_cache = {}
 
     # ---------------------------------------------------------------- DECIDE
     def decide_settings(self, profile: dict | None = None) -> Settings:
@@ -86,11 +88,14 @@ class GeneratorAgent:
         mimics = set(self.rng.sample([c["id"] for c in chests], k))
         return {c["id"]: c["id"] in mimics for c in chests}
 
-    def _candidates(self, speaker, chests, answer, pos, s: Settings):
-        """Every statement this speaker could make that fits the answer."""
+    def _candidates(self, speaker, chests, answer, pos, s: Settings, room=None, taken=()):
+        """Every statement this speaker could make that fits the answer, skipping
+        statements another chest already makes (taken) and giveaways: statements
+        whose truth is settled by the mimic count alone."""
         others = [c["id"] for c in chests if c["id"] != speaker]
         by_pos = {(c["row"], c["col"]): c["id"] for c in chests}
         must_be_true = not answer[speaker]
+        grid = (s.rows, s.cols)
         out = []
         for t in s.allowed_types:
             if t == "pattern":
@@ -102,8 +107,16 @@ class GeneratorAgent:
                            and not (t in ("either_one", "same_kind") and a > b)]
             for tg in options:
                 stmt = {"speaker": speaker, "type": t, "targets": tg}
-                if statement_truth(stmt, answer, pos) != must_be_true:
+                if statement_truth(stmt, answer, pos, grid) != must_be_true:
                     continue
+                key = statement_key(stmt)
+                if key in taken:
+                    continue
+                if room is not None:
+                    if key not in self._giveaway_cache:
+                        self._giveaway_cache[key] = is_giveaway(stmt, room)
+                    if self._giveaway_cache[key]:
+                        continue
                 if ARITY[t] == 1:  # use a direction word when the target is next door
                     r, c = pos[speaker]
                     for (dr, dc), word in DIRECTIONS.items():
@@ -124,6 +137,7 @@ class GeneratorAgent:
     # ---------------------------------------------------------------- GENERATE
     def generate(self, settings: Settings | None = None, profile: dict | None = None) -> dict:
         s = settings or self.decide_settings(profile)
+        self.level = (profile or {}).get("level")
         if s.num_chests > s.rows * s.cols:
             raise ValueError("More chests than grid cells.")
         for attempt in range(1, s.max_attempts + 1):
@@ -139,27 +153,29 @@ class GeneratorAgent:
         answer = self._pick_answer(chests, s)
         speakers = [c["id"] for c in chests]
         silent = set(self.rng.sample(speakers, min(s.silent_chests, len(speakers) - 1)))
-        stmts = {}
-        for sp in speakers:
-            if sp in silent:
-                continue
-            cands = self._candidates(sp, chests, answer, pos, s)
-            if cands:
-                stmts[sp] = self._choose(cands, s)
-
-        self.counter += 1
         room = {
-            "id": f"room-{self.counter:04d}",
+            "id": make_room_id(self.level),
             "grid": {"rows": s.rows, "cols": s.cols},
             "chests": chests,
-            "statements": [stmts[k] for k in speakers if k in stmts],
+            "statements": [],
             "hints": {"mimic_count": sum(answer.values()),
                       "show_mimic_count": s.show_mimic_count},
             "solution": {k: ("mimic" if v else "normal") for k, v in answer.items()},
+            "rules_version": RULES_VERSION,
             "rules": RULES,
             "instructions": INSTRUCTIONS,
             "meta": {},
         }
+        self._giveaway_cache = {}
+        stmts = {}
+        for sp in speakers:
+            if sp in silent:
+                continue
+            taken = {statement_key(x) for x in stmts.values()}
+            cands = self._candidates(sp, chests, answer, pos, s, room, taken)
+            if cands:
+                stmts[sp] = self._choose(cands, s)
+        room["statements"] = [stmts[k] for k in speakers if k in stmts]
 
         # VERIFY + REVISE
         repairs = 0
@@ -174,7 +190,11 @@ class GeneratorAgent:
             a, b = sols[0], sols[1]
             disputed = [c for c in speakers if a[c] != b[c] and c in stmts and c not in silent]
             pick = self.rng.choice(disputed or list(stmts))
-            stmts[pick] = self._choose(self._candidates(pick, chests, answer, pos, s), s)
+            taken = {statement_key(x) for k, x in stmts.items() if k != pick}
+            cands = self._candidates(pick, chests, answer, pos, s, room, taken)
+            if not cands:
+                return None
+            stmts[pick] = self._choose(cands, s)
             room["statements"] = [stmts[k] for k in speakers if k in stmts]
 
         if s.minimize:
